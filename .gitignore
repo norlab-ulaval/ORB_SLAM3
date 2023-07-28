@@ -1,6 +1,3 @@
-# Customize
-Pangolin/
-
 # Ignore all
 *
 
@@ -9,6 +6,9 @@ Pangolin/
 
 # Unignore all dirs
 !*/
+
+# Customize
+Pangolin/
 
 CMakeLists.txt.user
 CMakeLists_modified.txt

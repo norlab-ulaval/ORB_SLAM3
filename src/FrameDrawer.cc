@@ -192,6 +192,24 @@ cv::Mat FrameDrawer::DrawFrame(float imageScale)
                     mnTrackedVO++;
                 }
             }
+            else
+            {
+                // TEMPORARY DEBUG: extracted keypoints with no MapPoint this frame,
+                // normally invisible in this view. Split by whether stereo matching
+                // (Frame::ComputeStereoMatches) actually found a valid depth for them:
+                //   yellow = stereo-matched (valid depth) but never became/matched a MapPoint
+                //   red    = stereo matching failed outright (no depth at all)
+                // Remove this block (and the else above) to go back to stock behavior.
+                cv::Point2f point;
+                if(imageScale != 1.f)
+                    point = vCurrentKeys[i].pt / imageScale;
+                else
+                    point = vCurrentKeys[i].pt;
+
+                bool hasDepth = (i < (int)vCurrentDepth.size()) && (vCurrentDepth[i] > 0);
+                cv::Scalar debugColor = hasDepth ? cv::Scalar(0,255,255) : cv::Scalar(0,0,255);
+                cv::circle(im,point,3,debugColor,-1);
+            }
         }
     }
 

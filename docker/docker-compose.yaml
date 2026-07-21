@@ -1,0 +1,31 @@
+services:
+  orbslam3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        USERNAME: user
+        PASSWORD: docker
+        MY_UID: "1000"
+    container_name: orbslam3
+    stdin_open: true
+    tty: true
+    privileged: true
+    network_mode: "host"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - DISPLAY=${DISPLAY}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    command: ["bash"]
+    volumes:
+      - /dev/shm:/dev/shm
+      - ../:/home/user/code
+      - ${HOME}/data:/home/user/data
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw

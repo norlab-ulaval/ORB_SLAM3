@@ -10,6 +10,8 @@
 # Customize
 Pangolin/
 
+!docker/Dockerfile
+
 CMakeLists.txt.user
 CMakeLists_modified.txt
 

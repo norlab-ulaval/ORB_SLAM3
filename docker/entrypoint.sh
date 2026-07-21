@@ -1,18 +1,16 @@
 #!/bin/bash
-WORKSPACE="/home/user/repos"
+set -e
 
-cd $WORKSPACE/ \
-	&& git clone --recursive https://github.com/stevenlovegrove/Pangolin.git \
-	&& cd Pangolin/ \
-	&& git checkout v0.6 \
-	&& mkdir build && cd build \
-	&& cmake -DCPP11_NO_BOOST=1 .. \
-	&& make -j4
+cd "$WORKSPACE"
 
-cd $WORKSPACE
-source $WORKSPACE/build.sh
+if [ ! -f Vocabulary/ORBvoc.txt ]; then
+  echo "Decompressing ORB vocabulary..."
+  tar -xf Vocabulary/ORBvoc.txt.tar.gz -C Vocabulary
+fi
 
-cd $WORKSPACE
+if [ ! -f lib/libORB_SLAM3.so ]; then
+  echo "Building ORB-SLAM3 (first run)..."
+  ./build.sh
+fi
 
-# Execute the command passed into this entrypoint
 exec "$@"

@@ -1,0 +1,21 @@
+{
+    "name": "orb_slam3",
+    "dockerComposeFile": [
+        "../docker/docker-compose.yaml"
+    ],
+    "workspaceFolder": "/home/user/code",
+    "service": "orbslam3",
+    "remoteUser": "user",
+    "shutdownAction": "stopCompose",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools",
+                "ms-vscode.cpptools-extension-pack",
+                "ms-vscode.cmake-tools",
+                "ms-azuretools.vscode-docker",
+                "GitHub.copilot"
+            ]
+        }
+    }
+}

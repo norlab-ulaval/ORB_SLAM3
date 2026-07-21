@@ -499,7 +499,7 @@ namespace ORB_SLAM3 {
         cv::Mat R_r1_u1, R_r2_u2;
         cv::Mat P1, P2, Q;
 
-        cv::stereoRectify(K1,camera1DistortionCoef(),K2,camera2DistortionCoef(),newImSize_,
+        cv::stereoRectify(K1,camera1DistortionCoef(),K2,camera2DistortionCoef(),originalImSize_,
                           R12, t12,
                           R_r1_u1,R_r2_u2,P1,P2,Q,
                           cv::CALIB_ZERO_DISPARITY,-1,newImSize_);

@@ -1451,7 +1451,7 @@ bool Tracking::GetStepByStep()
 
 
 
-Sophus::SE3f Tracking::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat &imRectRight, const double &timestamp, string filename)
+Sophus::SE3f Tracking::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat &imRectRight, const double &timestamp, string filename, int exposurePhase)
 {
     //cout << "GrabImageStereo" << endl;
 
@@ -1503,6 +1503,7 @@ Sophus::SE3f Tracking::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat 
 
     mCurrentFrame.mNameFile = filename;
     mCurrentFrame.mnDataset = mnNumDataset;
+    mCurrentFrame.mnExposurePhase = exposurePhase;
 
 #ifdef REGISTER_TIMES
     vdORBExtract_ms.push_back(mCurrentFrame.mTimeORB_Ext);
@@ -1955,6 +1956,15 @@ void Tracking::Track()
                         bOK = TrackReferenceKeyFrame();
                 }
 
+                // Same-phase/cross-phase fallback: ordinary tracking already tried the
+                // immediately-adjacent frame/keyframe above and failed -- before giving up,
+                // try matching against recent frames/keyframes of each exposure phase
+                // instead (own phase first, see TrySamePhaseFallback). This is what lets a
+                // bracketed STEREO sequence survive a real illumination transient (e.g. a
+                // tunnel exit), where the adjacent (possibly differently-exposed) frame
+                // fails outright but a same/other-phase frame is still a good match.
+                if(!bOK)
+                    bOK = TrySamePhaseFallback();
 
                 if (!bOK)
                 {
@@ -1999,11 +2009,27 @@ void Tracking::Track()
                     }
                     else
                     {
-                        // Relocalization
-                        bOK = Relocalization();
+                        // Try the same-phase/cross-phase fallback before full relocalization:
+                        // Relocalization() is a BoW-database lookup that can only succeed
+                        // against PREVIOUSLY-mapped content, so it's structurally hopeless the
+                        // first time the camera sees genuinely new scenery (e.g. just past a
+                        // tunnel exit) -- confirmed empirically: widening its patience window
+                        // alone did not reduce resets on the yoda bracketing dataset's
+                        // tunnel-exit transient, it just delayed the same outcome. This
+                        // fallback only needs a recent frame/keyframe of some exposure phase
+                        // (which can be from just a few frames earlier in this same "lost"
+                        // stretch), so it can recover mid-transient the moment a well-exposed
+                        // frame of any phase reappears, without needing prior map coverage.
+                        bOK = TrySamePhaseFallback();
+
+                        if(!bOK)
+                        {
+                            // Relocalization
+                            bOK = Relocalization();
+                        }
                         //std::cout << "mCurrentFrame.mTimeStamp:" << to_string(mCurrentFrame.mTimeStamp) << std::endl;
                         //std::cout << "mTimeStampLost:" << to_string(mTimeStampLost) << std::endl;
-                        if(mCurrentFrame.mTimeStamp-mTimeStampLost>3.0f && !bOK)
+                        if(mCurrentFrame.mTimeStamp-mTimeStampLost>time_recently_lost && !bOK)
                         {
                             mState = LOST;
                             Verbose::PrintMess("Track Lost...", Verbose::VERBOSITY_NORMAL);
@@ -2215,6 +2241,34 @@ void Tracking::Track()
                 mbVelocity = false;
             }
 
+            // Same-phase velocity: computed against the last frame of the SAME exposure
+            // phase (still holding the *previous* occurrence at this point -- this
+            // frame's own per-phase slot is written later, see mLastFrameByPhase update).
+            // The VALUE is only updated on bOK (a failed attempt's pose is at best an
+            // unverified prediction, not a confirmed match, and feeding it in would
+            // compound error every cycle through a failure streak). But unlike that
+            // gating, mbVelocityByPhase itself must NOT be cleared to false on failure:
+            // doing so (an earlier version of this fix did) meant that after the first
+            // failure of a given phase, nothing ever set it back to true until that same
+            // phase next SUCCEEDED -- which can't happen during an all-failing streak, so
+            // TrackWithMotionModelSamePhase silently early-returned for the rest of the
+            // entire streak, never even attempting to match. Diagnosed on the yoda
+            // bracketing dataset's tunnel-exit reset: instrumented match counts showed
+            // only the reference-keyframe (BoW) fallback ever ran, zero motion-model
+            // attempts, for a 5-second/133-frame streak. A once-established velocity
+            // estimate should stay usable (if increasingly stale) exactly like the
+            // ordinary mVelocity above, which persists the same way.
+            {
+                const int phase = mCurrentFrame.mnExposurePhase;
+                if(bOK && mSensor==System::STEREO && phase>=0 && phase<NUM_EXPOSURE_PHASES &&
+                   mbLastFrameByPhaseSet[phase] && mLastFrameByPhase[phase].isSet() && mCurrentFrame.isSet())
+                {
+                    Sophus::SE3f LastTwcPhase = mLastFrameByPhase[phase].GetPose().inverse();
+                    mVelocityByPhase[phase] = mCurrentFrame.GetPose() * LastTwcPhase;
+                    mbVelocityByPhase[phase] = true;
+                }
+            }
+
             if(mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
                 mpMapDrawer->SetCurrentCameraPose(mCurrentFrame.GetPose());
 
@@ -2292,6 +2346,18 @@ void Tracking::Track()
             mCurrentFrame.mpReferenceKF = mpReferenceKF;
 
         mLastFrame = Frame(mCurrentFrame);
+
+        // Gated on bOK -- see the matching guard on the per-phase velocity update above for
+        // why: only advance the per-phase reference on a verified, successfully-matched
+        // pose, not a merely-predicted one from a failed attempt.
+        {
+            const int phase = mCurrentFrame.mnExposurePhase;
+            if(bOK && mSensor==System::STEREO && phase>=0 && phase<NUM_EXPOSURE_PHASES)
+            {
+                mLastFrameByPhase[phase] = Frame(mCurrentFrame);
+                mbLastFrameByPhaseSet[phase] = true;
+            }
+        }
     }
 
 
@@ -2433,6 +2499,12 @@ void Tracking::StereoInitialization()
         mvpLocalMapPoints=mpAtlas->GetAllMapPoints();
         mpReferenceKF = pKFini;
         mCurrentFrame.mpReferenceKF = pKFini;
+
+        {
+            const int phase = mCurrentFrame.mnExposurePhase;
+            if(mSensor==System::STEREO && phase>=0 && phase<NUM_EXPOSURE_PHASES)
+                mpReferenceKFByPhase[phase] = pKFini;
+        }
 
         mpAtlas->SetReferenceMapPoints(mvpLocalMapPoints);
 
@@ -2778,6 +2850,62 @@ bool Tracking::TrackReferenceKeyFrame()
         return nmatchesMap>=10;
 }
 
+bool Tracking::TrackReferenceKeyFrameSamePhase(int phase)
+{
+    if(!mpReferenceKFByPhase[phase] || !mbLastFrameByPhaseSet[phase] || !mLastFrameByPhase[phase].isSet())
+        return false;
+
+    mCurrentFrame.ComputeBoW();
+
+    ORBmatcher matcher(0.7,true);
+    vector<MapPoint*> vpMapPointMatches;
+
+    int nmatches = matcher.SearchByBoW(mpReferenceKFByPhase[phase],mCurrentFrame,vpMapPointMatches);
+
+    static const bool bDiag = (getenv("ORBSLAM_DIAG_SAMEPHASE") != nullptr);
+    if(bDiag)
+    {
+        double dtRef = mCurrentFrame.mTimeStamp - mpReferenceKFByPhase[phase]->mTimeStamp;
+        cout << "SAMEPHASE_RKF phase=" << phase << " nmatches=" << nmatches
+             << " refAgeSec=" << dtRef << endl;
+    }
+
+    if(nmatches<15)
+        return false;
+
+    mCurrentFrame.mvpMapPoints = vpMapPointMatches;
+    mCurrentFrame.SetPose(mLastFrameByPhase[phase].GetPose());
+
+    Optimizer::PoseOptimization(&mCurrentFrame);
+
+    int nmatchesMap = 0;
+    for(int i=0; i<mCurrentFrame.N; i++)
+    {
+        if(mCurrentFrame.mvpMapPoints[i])
+        {
+            if(mCurrentFrame.mvbOutlier[i])
+            {
+                MapPoint* pMP = mCurrentFrame.mvpMapPoints[i];
+
+                mCurrentFrame.mvpMapPoints[i]=static_cast<MapPoint*>(NULL);
+                mCurrentFrame.mvbOutlier[i]=false;
+                if(i < mCurrentFrame.Nleft){
+                    pMP->mbTrackInView = false;
+                }
+                else{
+                    pMP->mbTrackInViewR = false;
+                }
+                pMP->mnLastFrameSeen = mCurrentFrame.mnId;
+                nmatches--;
+            }
+            else if(mCurrentFrame.mvpMapPoints[i]->Observations()>0)
+                nmatchesMap++;
+        }
+    }
+
+    return nmatchesMap>=10;
+}
+
 void Tracking::UpdateLastFrame()
 {
     // Update pose according to reference keyframe
@@ -2944,6 +3072,118 @@ bool Tracking::TrackWithMotionModel()
         return true;
     else
         return nmatchesMap>=10;
+}
+
+bool Tracking::TrackWithMotionModelSamePhase(int phase)
+{
+    if(!mbLastFrameByPhaseSet[phase] || !mLastFrameByPhase[phase].isSet() || !mbVelocityByPhase[phase])
+        return false;
+
+    ORBmatcher matcher(0.9,true);
+
+    mCurrentFrame.SetPose(mVelocityByPhase[phase] * mLastFrameByPhase[phase].GetPose());
+
+    fill(mCurrentFrame.mvpMapPoints.begin(),mCurrentFrame.mvpMapPoints.end(),static_cast<MapPoint*>(NULL));
+
+    const int th = 7; // matches ordinary TrackWithMotionModel()'s STEREO threshold
+
+    int nmatches = matcher.SearchByProjection(mCurrentFrame,mLastFrameByPhase[phase],th,false);
+
+    if(nmatches<20)
+    {
+        fill(mCurrentFrame.mvpMapPoints.begin(),mCurrentFrame.mvpMapPoints.end(),static_cast<MapPoint*>(NULL));
+        nmatches = matcher.SearchByProjection(mCurrentFrame,mLastFrameByPhase[phase],2*th,false);
+    }
+
+    // A third, wider pass: unlike the ordinary (adjacent-frame) motion model, a same-phase
+    // reference can be many bracket cycles stale during a failure streak (diagnosed on the
+    // yoda bracketing dataset's tunnel-exit reset: instrumented match counts consistently
+    // landed at 15-18 -- just short of the 20 needed -- against a ~4s-stale reference, with
+    // th=2*7=14; that's a search window sized for a normal ~150ms gap, not several seconds
+    // of accumulated motion). Only worth the extra candidate-matching cost when the first
+    // two passes already got close, so gate it on nmatches>=10 rather than always running it.
+    if(nmatches<20 && nmatches>=10)
+    {
+        fill(mCurrentFrame.mvpMapPoints.begin(),mCurrentFrame.mvpMapPoints.end(),static_cast<MapPoint*>(NULL));
+        nmatches = matcher.SearchByProjection(mCurrentFrame,mLastFrameByPhase[phase],4*th,false);
+    }
+
+    static const bool bDiag = (getenv("ORBSLAM_DIAG_SAMEPHASE") != nullptr);
+    if(bDiag)
+    {
+        double dtRef = mCurrentFrame.mTimeStamp - mLastFrameByPhase[phase].mTimeStamp;
+        cout << "SAMEPHASE_MM phase=" << phase << " nmatches=" << nmatches
+             << " refAgeSec=" << dtRef << " refMPs=" << mLastFrameByPhase[phase].N << endl;
+    }
+
+    if(nmatches<20)
+        return false;
+
+    Optimizer::PoseOptimization(&mCurrentFrame);
+
+    int nmatchesMap = 0;
+    for(int i=0; i<mCurrentFrame.N; i++)
+    {
+        if(mCurrentFrame.mvpMapPoints[i])
+        {
+            if(mCurrentFrame.mvbOutlier[i])
+            {
+                MapPoint* pMP = mCurrentFrame.mvpMapPoints[i];
+
+                mCurrentFrame.mvpMapPoints[i]=static_cast<MapPoint*>(NULL);
+                mCurrentFrame.mvbOutlier[i]=false;
+                if(i < mCurrentFrame.Nleft){
+                    pMP->mbTrackInView = false;
+                }
+                else{
+                    pMP->mbTrackInViewR = false;
+                }
+                pMP->mnLastFrameSeen = mCurrentFrame.mnId;
+                nmatches--;
+            }
+            else if(mCurrentFrame.mvpMapPoints[i]->Observations()>0)
+                nmatchesMap++;
+        }
+    }
+
+    if(bDiag)
+        cout << "SAMEPHASE_MM_RESULT phase=" << phase << " nmatchesMap=" << nmatchesMap
+             << " (needed >=10)" << endl;
+
+    return nmatchesMap>=10;
+}
+
+bool Tracking::TrySamePhaseFallback()
+{
+    if(mSensor!=System::STEREO || mCurrentFrame.mnExposurePhase<0 || mCurrentFrame.mnExposurePhase>=NUM_EXPOSURE_PHASES)
+        return false;
+
+    const int phase = mCurrentFrame.mnExposurePhase;
+    bool bOK = TrackWithMotionModelSamePhase(phase);
+    if(!bOK)
+        bOK = TrackReferenceKeyFrameSamePhase(phase);
+
+    // Cross-phase: the current frame's own phase can itself be structurally compromised
+    // for a whole stretch (e.g. the long-exposure phase staying saturated throughout a
+    // tunnel-exit transient, so there's no good same-phase frame to fall back to either)
+    // -- try the other phases' last-frame/reference-KF too, since a different phase may
+    // happen to be well-exposed for the current real-world lighting even though this
+    // frame's own phase isn't. Phases are numbered by ascending exposure_factor (see
+    // stereo_general.cc's LoadExposurePhases), so this naturally tries the darkest
+    // remaining phase first.
+    if(!bOK)
+    {
+        for(int otherPhase = 0; otherPhase < NUM_EXPOSURE_PHASES && !bOK; otherPhase++)
+        {
+            if(otherPhase == phase)
+                continue;
+            bOK = TrackWithMotionModelSamePhase(otherPhase);
+            if(!bOK)
+                bOK = TrackReferenceKeyFrameSamePhase(otherPhase);
+        }
+    }
+
+    return bOK;
 }
 
 bool Tracking::TrackLocalMap()
@@ -3229,6 +3469,12 @@ void Tracking::CreateNewKeyFrame()
     pKF->SetNewBias(mCurrentFrame.mImuBias);
     mpReferenceKF = pKF;
     mCurrentFrame.mpReferenceKF = pKF;
+
+    {
+        const int phase = mCurrentFrame.mnExposurePhase;
+        if(mSensor==System::STEREO && phase>=0 && phase<NUM_EXPOSURE_PHASES)
+            mpReferenceKFByPhase[phase] = pKF;
+    }
 
     if(mpLastKeyFrame)
     {
@@ -3831,6 +4077,14 @@ void Tracking::Reset(bool bLocMap)
     mpLastKeyFrame = static_cast<KeyFrame*>(NULL);
     mvIniMatches.clear();
 
+    for(int i=0; i<NUM_EXPOSURE_PHASES; i++)
+    {
+        mLastFrameByPhase[i] = Frame();
+        mbLastFrameByPhaseSet[i] = false;
+        mpReferenceKFByPhase[i] = static_cast<KeyFrame*>(NULL);
+        mbVelocityByPhase[i] = false;
+    }
+
     if(mpViewer)
         mpViewer->Release();
 
@@ -3921,6 +4175,14 @@ void Tracking::ResetActiveMap(bool bLocMap)
     mvIniMatches.clear();
 
     mbVelocity = false;
+
+    for(int i=0; i<NUM_EXPOSURE_PHASES; i++)
+    {
+        mLastFrameByPhase[i] = Frame();
+        mbLastFrameByPhaseSet[i] = false;
+        mpReferenceKFByPhase[i] = static_cast<KeyFrame*>(NULL);
+        mbVelocityByPhase[i] = false;
+    }
 
     if(mpViewer)
         mpViewer->Release();

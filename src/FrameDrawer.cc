@@ -93,7 +93,7 @@ cv::Mat FrameDrawer::DrawFrame(float imageScale)
             thDepth = mThDepth;
 
         }
-        else if(mState==Tracking::LOST)
+        else if(mState==Tracking::LOST || mState==Tracking::RECENTLY_LOST)
         {
             vCurrentKeys = mvCurrentKeys;
         }
@@ -212,6 +212,19 @@ cv::Mat FrameDrawer::DrawFrame(float imageScale)
             }
         }
     }
+    else if(state==Tracking::RECENTLY_LOST)
+    {
+        const cv::Scalar recentlyLostColor(128,128,128);
+        for(unsigned int i=0; i<vCurrentKeys.size(); i++)
+        {
+            cv::Point2f point;
+            if(imageScale != 1.f)
+                point = vCurrentKeys[i].pt / imageScale;
+            else
+                point = vCurrentKeys[i].pt;
+            cv::circle(im,point,2,recentlyLostColor,-1);
+        }
+    }
 
     cv::Mat imWithInfo;
     DrawTextInfo(im,state, imWithInfo);
@@ -249,7 +262,7 @@ cv::Mat FrameDrawer::DrawRightFrame(float imageScale)
             vbVO = mvbVO;
             vbMap = mvbMap;
         }
-        else if(mState==Tracking::LOST)
+        else if(mState==Tracking::LOST || mState==Tracking::RECENTLY_LOST)
         {
             vCurrentKeys = mvCurrentKeysRight;
         }
@@ -337,6 +350,19 @@ cv::Mat FrameDrawer::DrawRightFrame(float imageScale)
             }
         }
     }
+    else if(state==Tracking::RECENTLY_LOST)
+    {
+        const cv::Scalar recentlyLostColor(128,128,128);
+        for(unsigned int i=0; i<vCurrentKeys.size(); i++)
+        {
+            cv::Point2f point;
+            if(imageScale != 1.f)
+                point = vCurrentKeys[i].pt / imageScale;
+            else
+                point = vCurrentKeys[i].pt;
+            cv::circle(im,point,2,recentlyLostColor,-1);
+        }
+    }
 
     cv::Mat imWithInfo;
     DrawTextInfo(im,state, imWithInfo);
@@ -365,6 +391,10 @@ void FrameDrawer::DrawTextInfo(cv::Mat &im, int nState, cv::Mat &imText)
         s << "Maps: " << nMaps << ", KFs: " << nKFs << ", MPs: " << nMPs << ", Matches: " << mnTracked;
         if(mnTrackedVO>0)
             s << ", + VO matches: " << mnTrackedVO;
+    }
+    else if(nState==Tracking::RECENTLY_LOST)
+    {
+        s << " RECENTLY LOST - ATTEMPTING RECOVERY ";
     }
     else if(nState==Tracking::LOST)
     {

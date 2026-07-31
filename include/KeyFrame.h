@@ -418,6 +418,12 @@ public:
 
     int mnDataset;
 
+    // Exposure-bracket phase of the constituent Frame (e.g. 0-3 for a dark/mid/bright/mid
+    // cycle), or -1 if unknown/not applicable. Lets MapPoint bucket its observations by
+    // phase for a per-phase representative descriptor (see MapPoint::mDescriptorByPhase),
+    // used by TrackLocalMap's local-map matching to prefer a phase-appropriate descriptor.
+    int mnExposurePhase;
+
     std::vector <KeyFrame*> mvpLoopCandKFs;
     std::vector <KeyFrame*> mvpMergeCandKFs;
 

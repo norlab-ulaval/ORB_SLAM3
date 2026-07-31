@@ -107,7 +107,11 @@ public:
     // Proccess the given stereo frame. Images must be synchronized and rectified.
     // Input images: RGB (CV_8UC3) or grayscale (CV_8U). RGB is converted to grayscale.
     // Returns the camera pose (empty if tracking fails).
-    Sophus::SE3f TrackStereo(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp, const vector<IMU::Point>& vImuMeas = vector<IMU::Point>(), string filename="");
+    // exposurePhase: exposure-bracket phase of this frame (e.g. 0-3 for a 4-frame
+    // dark/mid/bright/mid cycle), or -1 if unknown/not applicable (default). Lets
+    // Tracking keep a per-phase last-frame/reference-keyframe so frame-to-frame
+    // tracking can compare against the most recent same-exposure frame.
+    Sophus::SE3f TrackStereo(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp, const vector<IMU::Point>& vImuMeas = vector<IMU::Point>(), string filename="", int exposurePhase=-1);
 
     // Process the given rgbd frame. Depthmap must be registered to the RGB frame.
     // Input image: RGB (CV_8UC3) or grayscale (CV_8U). RGB is converted to grayscale.
@@ -185,6 +189,12 @@ public:
     void ChangeDataset();
 
     float GetImageScale();
+
+    // Renders the same annotated (tracked keypoints overlaid) image the Pangolin viewer
+    // shows for the current/last-processed frame, independent of whether the viewer is
+    // active -- lets a headless run still capture the tracking visualization (e.g. for
+    // offline video export).
+    cv::Mat GetFrameDrawerImage(float imageScale=1.f);
 
 #ifdef REGISTER_TIMES
     void InsertRectTime(double& time);

@@ -298,6 +298,13 @@ public:
 
     int mnDataset;
 
+    // Exposure-bracket phase (e.g. 0-3 for a 4-frame dark/mid/bright/mid cycle), or -1
+    // if unknown/not applicable. Set from System::TrackStereo's optional parameter;
+    // used by Tracking to keep a per-phase last-frame/reference-keyframe/velocity so
+    // frame-to-frame tracking compares against the most recent same-exposure frame
+    // instead of whatever (possibly differently-exposed) frame immediately preceded it.
+    int mnExposurePhase = -1;
+
 #ifdef REGISTER_TIMES
     double mTimeORB_Ext;
     double mTimeStereoMatch;

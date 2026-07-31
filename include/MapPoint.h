@@ -145,6 +145,12 @@ public:
 
     cv::Mat GetDescriptor();
 
+    // Per-exposure-phase representative descriptor (see ComputeDistinctiveDescriptors),
+    // for matching against a query frame of a known bracket phase. Falls back to the
+    // general (all-observations) descriptor if this MapPoint has no observation from that
+    // phase (or phase is -1/unknown), so this is always safe to call.
+    cv::Mat GetDescriptor(int phase);
+
     void UpdateNormalAndDepth();
 
     float GetMinDistanceInvariance();
@@ -223,6 +229,13 @@ protected:
 
      // Best descriptor to fast matching
      cv::Mat mDescriptor;
+
+     // Per-exposure-bracket-phase representative descriptors (index = phase 0-3), computed
+     // alongside mDescriptor in ComputeDistinctiveDescriptors() by bucketing observations
+     // by each observing KeyFrame's mnExposurePhase. Left empty (cv::Mat()) for phases this
+     // point has no observation from -- GetDescriptor(phase) falls back to mDescriptor then.
+     static const int NUM_EXPOSURE_PHASES = 4;
+     cv::Mat mDescriptorByPhase[NUM_EXPOSURE_PHASES];
 
      // Reference KeyFrame
      KeyFrame* mpRefKF;

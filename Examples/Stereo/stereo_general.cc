@@ -30,6 +30,10 @@
 #include<iomanip>
 #include<chrono>
 #include<map>
+#include<set>
+#include<cmath>
+#include<fstream>
+#include<sstream>
 
 #include<dirent.h>
 
@@ -41,6 +45,13 @@ using namespace std;
 
 void LoadImages(const string &strPathLeft, const string &strPathRight,
                 vector<string> &vstrImageLeft, vector<string> &vstrImageRight, vector<double> &vTimeStamps);
+
+// Reads <pathSeq>/images_meta_left/images_meta_left.csv (if present) and returns each
+// frame's exposure-bracket sequence_index (0-3), keyed by the same nanosecond
+// timestamp used for the frame's filename. Frames with no matching row, or when the
+// CSV itself is missing (e.g. a non-bracketed dataset), get phase -1 (unknown).
+void LoadExposurePhases(const string &pathSeq, const vector<double> &vTimeStamps,
+                        vector<int> &vExposurePhase);
 
 int main(int argc, char **argv)
 {
@@ -78,11 +89,13 @@ int main(int argc, char **argv)
     vector< vector<string> > vstrImageLeft;
     vector< vector<string> > vstrImageRight;
     vector< vector<double> > vTimestampsCam;
+    vector< vector<int> > vExposurePhaseCam;
     vector<int> nImages;
 
     vstrImageLeft.resize(num_seq_real);
     vstrImageRight.resize(num_seq_real);
     vTimestampsCam.resize(num_seq_real);
+    vExposurePhaseCam.resize(num_seq_real);
     nImages.resize(num_seq_real);
 
     int tot_images = 0;
@@ -95,6 +108,7 @@ int main(int argc, char **argv)
         string pathRight = pathSeq + "/images_right";
 
         LoadImages(pathLeft, pathRight, vstrImageLeft[seq], vstrImageRight[seq], vTimestampsCam[seq]);
+        LoadExposurePhases(pathSeq, vTimestampsCam[seq], vExposurePhaseCam[seq]);
         cout << "LOADED!" << endl;
 
         nImages[seq] = vstrImageLeft[seq].size();
@@ -109,7 +123,16 @@ int main(int argc, char **argv)
     cout.precision(17);
 
     // Create SLAM system. It initializes all system threads and gets ready to process frames.
-    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::STEREO, true);
+    // Viewer.on: 0 in the settings yaml disables the Pangolin viewer for headless/batch runs
+    // (defaults to on, so existing configs without this key behave as before).
+    bool bUseViewer = true;
+    {
+        cv::FileStorage fSettings(argv[2], cv::FileStorage::READ);
+        cv::FileNode node = fSettings["Viewer.on"];
+        if(!node.empty())
+            bUseViewer = (int)node != 0;
+    }
+    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::STEREO, bUseViewer);
 
     cv::Mat imLeft, imRight;
     for (seq = 0; seq<num_seq_real; seq++)
@@ -137,10 +160,40 @@ int main(int argc, char **argv)
 
             double tframe = vTimestampsCam[seq][ni];
 
+            // Diagnostic per-frame marker (ORBSLAM_LOG_FRAMES=1) so tracking log lines
+            // interleaved on stdout can be pinned to a raw frame index / dataset timestamp.
+            static const bool bLogFrames = (getenv("ORBSLAM_LOG_FRAMES") != nullptr);
+            if(bLogFrames)
+                cout << "FRAME ni=" << ni << " ts_ns=" << llround(tframe*1e9) << endl;
+
             std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
 
             // Pass the images to the SLAM system
-            SLAM.TrackStereo(imLeft,imRight,tframe, vector<ORB_SLAM3::IMU::Point>(), vstrImageLeft[seq][ni]);
+            SLAM.TrackStereo(imLeft,imRight,tframe, vector<ORB_SLAM3::IMU::Point>(), vstrImageLeft[seq][ni], vExposurePhaseCam[seq][ni]);
+
+            // Diagnostic frame export (ORBSLAM_DUMP_FRAMES_DIR=<dir>): saves the same
+            // tracked-keypoints-overlaid image the Pangolin viewer shows, one PNG per
+            // frame, independent of whether the viewer is active -- for offline video
+            // export of a headless run. ORBSLAM_DUMP_START_NS/ORBSLAM_DUMP_END_NS
+            // (optional) restrict dumping to a raw-timestamp window so a full-dataset
+            // run doesn't have to save every frame just to capture one segment.
+            static const char *dumpDir = getenv("ORBSLAM_DUMP_FRAMES_DIR");
+            if(dumpDir)
+            {
+                static const char *startEnv = getenv("ORBSLAM_DUMP_START_NS");
+                static const char *endEnv = getenv("ORBSLAM_DUMP_END_NS");
+                static const long long dumpStartNs = startEnv ? atoll(startEnv) : -1;
+                static const long long dumpEndNs = endEnv ? atoll(endEnv) : -1;
+                const long long tsNs = llround(tframe*1e9);
+                if((dumpStartNs < 0 || tsNs >= dumpStartNs) && (dumpEndNs < 0 || tsNs <= dumpEndNs))
+                {
+                    static int dumpIdx = 0;
+                    cv::Mat drawn = SLAM.GetFrameDrawerImage();
+                    char fname[512];
+                    snprintf(fname, sizeof(fname), "%s/frame_%06d.png", dumpDir, dumpIdx++);
+                    cv::imwrite(fname, drawn);
+                }
+            }
 
             std::chrono::steady_clock::time_point t2 = std::chrono::steady_clock::now();
 
@@ -269,4 +322,97 @@ void LoadImages(const string &strPathLeft, const string &strPathRight,
              << " and " << strPathRight << endl;
         exit(1);
     }
+}
+
+// Max distinct exposure-phase buckets supported; must match Tracking::NUM_EXPOSURE_PHASES
+// and MapPoint::NUM_EXPOSURE_PHASES.
+static const int MAX_EXPOSURE_PHASES = 4;
+
+void LoadExposurePhases(const string &pathSeq, const vector<double> &vTimeStamps,
+                        vector<int> &vExposurePhase)
+{
+    vExposurePhase.assign(vTimeStamps.size(), -1);
+
+    const string metaPath = pathSeq + "/images_meta_left/images_meta_left.csv";
+    ifstream f(metaPath);
+    if(!f.is_open())
+        return; // not a bracketed dataset (or metadata not present) -- leave phase unknown
+
+    string header;
+    getline(f, header);
+    vector<string> cols;
+    {
+        stringstream ss(header);
+        string col;
+        while(getline(ss, col, ','))
+            cols.push_back(col);
+    }
+    int tsCol = -1, expCol = -1;
+    for(size_t i = 0; i < cols.size(); i++)
+    {
+        if(cols[i] == "timestamp") tsCol = (int)i;
+        if(cols[i] == "exposure_factor") expCol = (int)i;
+    }
+    if(tsCol < 0 || expCol < 0)
+    {
+        cerr << "WARNING: " << metaPath << " missing 'timestamp'/'exposure_factor' columns "
+             << "-- exposure phase will be left unknown." << endl;
+        return;
+    }
+
+    // Phase is derived from the frame's ACTUAL exposure_factor, not any nominal bracket
+    // "slot" label (e.g. a sequence_index/cycle-position column) -- the camera's AE can
+    // override the nominal slot's exposure during rapid lighting changes (confirmed: ~10
+    // frames dataset-wide have a "dark slot" position actually shot at 1.0x/4.0x), and
+    // using the true exposure keeps same-phase matching/fallback self-consistent even then.
+    map<unsigned long long, double> exposureByTs;
+    string line;
+    while(getline(f, line))
+    {
+        stringstream ss(line);
+        string field;
+        vector<string> fields;
+        while(getline(ss, field, ','))
+            fields.push_back(field);
+        if((int)fields.size() <= max(tsCol, expCol))
+            continue;
+        exposureByTs[stoull(fields[tsCol])] = stod(fields[expCol]);
+    }
+
+    // Bucket by distinct exposure_factor value (ascending) rather than hardcoding expected
+    // values -- naturally merges e.g. two nominal bracket slots that share the same actual
+    // exposure_factor (1.0x) into one phase, and adapts to whatever bracket scheme a given
+    // dataset actually used.
+    set<double> distinctExposures;
+    for(const auto &kv : exposureByTs)
+        distinctExposures.insert(kv.second);
+
+    map<double,int> phaseByExposure;
+    {
+        int phase = 0;
+        for(double e : distinctExposures)
+        {
+            if(phase >= MAX_EXPOSURE_PHASES)
+            {
+                cerr << "WARNING: " << metaPath << " has more than " << MAX_EXPOSURE_PHASES
+                     << " distinct exposure_factor values -- extras left as unknown (-1)." << endl;
+                break;
+            }
+            phaseByExposure[e] = phase++;
+        }
+    }
+
+    size_t nMissing = 0;
+    for(size_t i = 0; i < vTimeStamps.size(); i++)
+    {
+        auto it = exposureByTs.find(llround(vTimeStamps[i] * 1e9));
+        if(it != exposureByTs.end() && phaseByExposure.count(it->second))
+            vExposurePhase[i] = phaseByExposure[it->second];
+        else
+            nMissing++;
+    }
+
+    if(nMissing > 0)
+        cerr << "WARNING: " << nMissing << " of " << vTimeStamps.size()
+             << " frame(s) had no exposure-phase metadata; left as unknown (-1)." << endl;
 }

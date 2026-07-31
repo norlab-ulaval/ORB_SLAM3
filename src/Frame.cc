@@ -64,6 +64,7 @@ Frame::Frame(const Frame &frame)
      mnId(frame.mnId), mpReferenceKF(frame.mpReferenceKF), mnScaleLevels(frame.mnScaleLevels),
      mfScaleFactor(frame.mfScaleFactor), mfLogScaleFactor(frame.mfLogScaleFactor),
      mvScaleFactors(frame.mvScaleFactors), mvInvScaleFactors(frame.mvInvScaleFactors), mNameFile(frame.mNameFile), mnDataset(frame.mnDataset),
+     mnExposurePhase(frame.mnExposurePhase),
      mvLevelSigma2(frame.mvLevelSigma2), mvInvLevelSigma2(frame.mvInvLevelSigma2), mpPrevFrame(frame.mpPrevFrame), mpLastKeyFrame(frame.mpLastKeyFrame),
      mbIsSet(frame.mbIsSet), mbImuPreintegrated(frame.mbImuPreintegrated), mpMutexImu(frame.mpMutexImu),
      mpCamera(frame.mpCamera), mpCamera2(frame.mpCamera2), Nleft(frame.Nleft), Nright(frame.Nright),
@@ -935,6 +936,33 @@ void Frame::ComputeStereoMatches()
             if(bestincR==-L || bestincR==L)
                 continue;
 
+            // Confidence gate: reject an ambiguous sub-pixel match -- one where some
+            // OTHER candidate shift (excluding the best's immediate neighbors, which
+            // the parabola fit below already uses and which naturally score close to
+            // the best on any smooth unimodal cost curve) scores nearly as well as the
+            // best. Under low-light/noisy conditions the raw-intensity SAD above can't
+            // tell real texture from sensor noise, so it can pick a plausible-but-wrong
+            // shift with no other symptom -- this is the only place in the pipeline
+            // that can catch that, since the outlier filter below only checks
+            // descriptor distance from the COARSE match, not this refinement's own
+            // quality. Diagnosed on the yoda bracketing dataset's tunnel-exit reset:
+            // raw 2D matches against these depths routinely reached 40-58, while
+            // almost none (0-7) survived pose optimization as geometrically
+            // consistent -- i.e. most of the matched points' 3D positions were wrong.
+            {
+                float secondBestDist = 1e9f;
+                for(int incR=-L; incR<=+L; incR++)
+                {
+                    if(abs(incR-bestincR)<=1)
+                        continue; // skip the best and its immediate neighbors (parabola fit)
+                    if(vDists[L+incR]<secondBestDist)
+                        secondBestDist = vDists[L+incR];
+                }
+                const float fMatchConfidenceRatio = 0.8f;
+                if(secondBestDist<1e9f && bestDist>fMatchConfidenceRatio*secondBestDist)
+                    continue;
+            }
+
             // Sub-pixel match (Parabola fitting)
             const float dist1 = vDists[L+bestincR-1];
             const float dist2 = vDists[L+bestincR];
@@ -978,8 +1006,19 @@ void Frame::ComputeStereoMatches()
             mvDepth[vDistIdx[i].second]=-1;
         }
     }
-}
 
+    static const bool bDiagStereo = (getenv("ORBSLAM_DIAG_STEREO") != nullptr);
+    if(bDiagStereo)
+    {
+        int nValidDepth = 0;
+        for(int i=0;i<N;i++)
+            if(mvDepth[i]>0) nValidDepth++;
+        cout << "STEREO_MATCH phase=" << mnExposurePhase << " N=" << N
+             << " validDepth=" << nValidDepth
+             << " candidateDisparities=" << vDistIdx.size()
+             << " ts=" << (long long)llround(mTimeStamp*1e9) << endl;
+    }
+}
 
 void Frame::ComputeStereoFromRGBD(const cv::Mat &imDepth)
 {

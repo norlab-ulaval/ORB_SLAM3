@@ -72,7 +72,7 @@ namespace ORB_SLAM3
                         F.GetFeaturesInArea(pMP->mTrackProjX,pMP->mTrackProjY,r*F.mvScaleFactors[nPredictedLevel],nPredictedLevel-1,nPredictedLevel);
 
                 if(!vIndices.empty()){
-                    const cv::Mat MPdescriptor = pMP->GetDescriptor();
+                    const cv::Mat MPdescriptor = pMP->GetDescriptor(F.mnExposurePhase);
 
                     int bestDist=256;
                     int bestLevel= -1;
@@ -152,7 +152,7 @@ namespace ORB_SLAM3
                     if(vIndices.empty())
                         continue;
 
-                    const cv::Mat MPdescriptor = pMP->GetDescriptor();
+                    const cv::Mat MPdescriptor = pMP->GetDescriptor(F.mnExposurePhase);
 
                     int bestDist=256;
                     int bestLevel= -1;

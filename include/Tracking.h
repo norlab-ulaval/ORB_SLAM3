@@ -69,7 +69,7 @@ public:
     bool ParseIMUParamFile(cv::FileStorage &fSettings);
 
     // Preprocess the input and call Track(). Extract features and performs stereo matching.
-    Sophus::SE3f GrabImageStereo(const cv::Mat &imRectLeft,const cv::Mat &imRectRight, const double &timestamp, string filename);
+    Sophus::SE3f GrabImageStereo(const cv::Mat &imRectLeft,const cv::Mat &imRectRight, const double &timestamp, string filename, int exposurePhase=-1);
     Sophus::SE3f GrabImageRGBD(const cv::Mat &imRGB,const cv::Mat &imD, const double &timestamp, string filename);
     Sophus::SE3f GrabImageMonocular(const cv::Mat &im, const double &timestamp, string filename);
 
@@ -137,6 +137,19 @@ public:
     // Current Frame
     Frame mCurrentFrame;
     Frame mLastFrame;
+
+    // Per-exposure-bracket-phase state for same-phase-first tracking (see Track()):
+    // a frame of a given phase (Frame::mnExposurePhase, e.g. 0-3 for a dark/mid/bright/mid
+    // cycle) is primarily matched against the most recent frame/keyframe/velocity of the
+    // SAME phase rather than whatever (possibly differently-exposed) frame immediately
+    // preceded it, so each phase's own temporal continuity can survive a real illumination
+    // transient (e.g. a tunnel exit) independently. Only populated/used for STEREO with a
+    // known phase (>=0); inert otherwise, so every other sensor mode/dataset is unaffected.
+    // All still contribute to one shared Atlas map -- these are tracking-reference aids,
+    // not separate maps.
+    static const int NUM_EXPOSURE_PHASES = 4;
+    Frame mLastFrameByPhase[NUM_EXPOSURE_PHASES];
+    bool mbLastFrameByPhaseSet[NUM_EXPOSURE_PHASES] = {false,false,false,false};
 
     cv::Mat mImGray;
 
@@ -211,6 +224,23 @@ protected:
     bool TrackWithMotionModel();
     bool PredictStateIMU();
 
+    // Self-contained (STEREO only, no IMU branches) same-phase-first tracking attempt:
+    // mirrors TrackWithMotionModel()/TrackReferenceKeyFrame() but matches mCurrentFrame
+    // against the most recent frame/keyframe of the SAME exposure-bracket phase
+    // (mLastFrameByPhase/mpReferenceKFByPhase) instead of the ordinary temporally-adjacent
+    // mLastFrame/mpReferenceKF. Returns false (caller falls through to the ordinary
+    // functions) if there's no usable same-phase history yet or matching fails.
+    bool TrackWithMotionModelSamePhase(int phase);
+    bool TrackReferenceKeyFrameSamePhase(int phase);
+
+    // Tries TrackWithMotionModelSamePhase/TrackReferenceKeyFrameSamePhase for the current
+    // frame's own phase, then every other phase in turn. Used both as a fallback after
+    // ordinary tracking fails (state OK) and, critically, during RECENTLY_LOST -- unlike
+    // Relocalization() (BoW-database lookup, only succeeds against previously-mapped
+    // content), this only needs a recent frame/keyframe of some phase, so it can recover
+    // mid-transient the moment a well-exposed frame of ANY phase reappears.
+    bool TrySamePhaseFallback();
+
     bool Relocalization();
 
     void UpdateLocalMap();
@@ -271,6 +301,8 @@ protected:
 
     //Local Map
     KeyFrame* mpReferenceKF;
+    // Per-exposure-phase counterpart of mpReferenceKF -- see mLastFrameByPhase above.
+    KeyFrame* mpReferenceKFByPhase[NUM_EXPOSURE_PHASES] = {nullptr,nullptr,nullptr,nullptr};
     std::vector<KeyFrame*> mvpLocalKeyFrames;
     std::vector<MapPoint*> mvpLocalMapPoints;
     
@@ -331,6 +363,12 @@ protected:
     //Motion Model
     bool mbVelocity{false};
     Sophus::SE3f mVelocity;
+
+    // Per-exposure-phase counterpart of mVelocity/mbVelocity -- a shared single velocity
+    // would be biased/aliased across phases, since same-phase frames are ~4x further
+    // apart in time than temporally-adjacent frames of a 4-phase bracket cycle.
+    bool mbVelocityByPhase[NUM_EXPOSURE_PHASES] = {false,false,false,false};
+    Sophus::SE3f mVelocityByPhase[NUM_EXPOSURE_PHASES];
 
     //Color order (true RGB, false BGR, ignored if grayscale)
     bool mbRGB;

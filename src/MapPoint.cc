@@ -330,6 +330,7 @@ void MapPoint::ComputeDistinctiveDescriptors()
 {
     // Retrieve all observed descriptors
     vector<cv::Mat> vDescriptors;
+    vector<int> vDescriptorPhases; // exposure-bracket phase of the KF each descriptor came from (-1 if unknown)
 
     map<KeyFrame*,tuple<int,int>> observations;
 
@@ -344,6 +345,7 @@ void MapPoint::ComputeDistinctiveDescriptors()
         return;
 
     vDescriptors.reserve(observations.size());
+    vDescriptorPhases.reserve(observations.size());
 
     for(map<KeyFrame*,tuple<int,int>>::iterator mit=observations.begin(), mend=observations.end(); mit!=mend; mit++)
     {
@@ -355,9 +357,11 @@ void MapPoint::ComputeDistinctiveDescriptors()
 
             if(leftIndex != -1){
                 vDescriptors.push_back(pKF->mDescriptors.row(leftIndex));
+                vDescriptorPhases.push_back(pKF->mnExposurePhase);
             }
             if(rightIndex != -1){
                 vDescriptors.push_back(pKF->mDescriptors.row(rightIndex));
+                vDescriptorPhases.push_back(pKF->mnExposurePhase);
             }
         }
     }
@@ -396,15 +400,63 @@ void MapPoint::ComputeDistinctiveDescriptors()
         }
     }
 
+    // Same least-median-distance selection, but restricted to each exposure-bracket
+    // phase's own subset of observed descriptors -- lets matching prefer a descriptor
+    // variant observed under the SAME lighting as the current query frame (see
+    // GetDescriptor(phase)) instead of always using the single all-observations
+    // "compromise" descriptor above, which is what TrackLocalMap's local-map matching
+    // (ORBmatcher::SearchByProjection(Frame&, vector<MapPoint*>&, ...)) reads.
+    cv::Mat descriptorByPhase[NUM_EXPOSURE_PHASES];
+    for(int phase = 0; phase < NUM_EXPOSURE_PHASES; phase++)
+    {
+        vector<size_t> vIdxInPhase;
+        for(size_t i=0;i<N;i++)
+            if(vDescriptorPhases[i]==phase)
+                vIdxInPhase.push_back(i);
+
+        if(vIdxInPhase.empty())
+            continue;
+
+        int bestMedianPhase = INT_MAX;
+        size_t bestIdxPhase = vIdxInPhase[0];
+        for(size_t ii : vIdxInPhase)
+        {
+            vector<int> vDists;
+            vDists.reserve(vIdxInPhase.size());
+            for(size_t jj : vIdxInPhase)
+                vDists.push_back(Distances[ii][jj]);
+            sort(vDists.begin(),vDists.end());
+            int median = vDists[0.5*(vDists.size()-1)];
+
+            if(median<bestMedianPhase)
+            {
+                bestMedianPhase = median;
+                bestIdxPhase = ii;
+            }
+        }
+
+        descriptorByPhase[phase] = vDescriptors[bestIdxPhase].clone();
+    }
+
     {
         unique_lock<mutex> lock(mMutexFeatures);
         mDescriptor = vDescriptors[BestIdx].clone();
+        for(int phase = 0; phase < NUM_EXPOSURE_PHASES; phase++)
+            mDescriptorByPhase[phase] = descriptorByPhase[phase];
     }
 }
 
 cv::Mat MapPoint::GetDescriptor()
 {
     unique_lock<mutex> lock(mMutexFeatures);
+    return mDescriptor.clone();
+}
+
+cv::Mat MapPoint::GetDescriptor(int phase)
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    if(phase >= 0 && phase < NUM_EXPOSURE_PHASES && !mDescriptorByPhase[phase].empty())
+        return mDescriptorByPhase[phase].clone();
     return mDescriptor.clone();
 }
 

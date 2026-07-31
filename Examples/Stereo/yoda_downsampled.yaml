@@ -74,6 +74,8 @@ ORBextractor.minThFAST: 7
 #--------------------------------------------------------------------------------------------
 # Viewer Parameters
 #--------------------------------------------------------------------------------------------
+# Set to 0 to run headless (no Pangolin window), e.g. for batch/automated test runs.
+Viewer.on: 1
 Viewer.KeyFrameSize: 0.05
 Viewer.KeyFrameLineWidth: 1.0
 Viewer.GraphLineWidth: 0.9

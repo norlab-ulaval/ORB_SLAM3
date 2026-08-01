@@ -151,6 +151,13 @@ public:
     // phase (or phase is -1/unknown), so this is always safe to call.
     cv::Mat GetDescriptor(int phase);
 
+    // Diagnostic: true iff GetDescriptor(phase) would return this point's own
+    // phase-specific descriptor rather than falling back to the general one. Used to
+    // check whether local-map matches against a bracket-extreme-phase query frame are
+    // quietly using a phase-mismatched "compromise" descriptor for points this phase
+    // has never actually observed.
+    bool HasPhaseDescriptor(int phase);
+
     void UpdateNormalAndDepth();
 
     float GetMinDistanceInvariance();

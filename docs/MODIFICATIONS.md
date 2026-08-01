@@ -5,7 +5,7 @@ This documents everything this fork (branch `bracketing`, diverged from `master`
 commits already on the branch and the still-uncommitted working-tree changes made while
 diagnosing/fixing the exposure-bracketing tunnel-exit tracking break.
 
-Two goals drove almost everything below:
+Three goals drove almost everything below:
 1. Run ORB-SLAM3 stereo on a custom dataset (directory of timestamp-named PNGs + a
    per-frame exposure-bracketing metadata CSV), captured specifically to survive
    extreme-dynamic-range transitions (e.g. exiting a tunnel) by cycling exposure
@@ -14,6 +14,10 @@ Two goals drove almost everything below:
    tunnel-exit transient, without resorting to deep-learning stereo (explicitly out of
    scope) or discarding any of the bracket-cycle exposures (also explicitly out of
    scope — the dark exposure is precisely what should survive the transient).
+3. Once resets were eliminated, diagnose and fix a subtler problem on a second dataset:
+   bracketing tracked with zero resets but was measurably *less smooth* than a plain
+   constant-exposure run over the identical physical route — the opposite of what more
+   exposure information should buy (§6).
 
 Full diff: `git diff master` from repo root (or `git diff 7816c4a` — same base).
 
@@ -286,7 +290,98 @@ exposure-only frame stream through the tunnel region) confirmed bracketing is st
 (11 resets), because the confidence gate can only reject bad depths, not manufacture
 scene information a genuinely too-dark/too-bright frame doesn't have.
 
-## 6. Diagnostic instrumentation (env-var gated, zero cost when unset)
+## 6. Per-phase descriptor coverage & keyframe match-yield gate (July 31 stair dataset)
+
+A second, independent dataset pair (`yoda_july31_stair_bracketing`/`yoda_july31_stair_ae`,
+captured back-to-back at the same physical location, both with LiDAR ground truth) surfaced
+a different problem than the tunnel-exit reset: the bracketing run tracked with zero resets
+but was visibly **less smooth** than a classical constant-exposure AE run over the identical
+route — the opposite of what more exposure diversity should buy. A same-physical-loop
+trajectory overlay showed AE returning close to its starting height by the end of a ~44m
+loop, while bracketing drifted to a spurious ≈−2.8m by the end.
+
+**Investigation (see `tools/bracketing_diag/analyze_phase_quality.py`, new)** ruled out
+several plausible-sounding hypotheses before finding the real one — each tested directly
+against instrumented data, not assumed:
+- **Not clustered/sparse keypoints.** A per-frame spatial-spread diagnostic (grid-occupancy
+  of valid-depth keypoints, added to `ORBSLAM_DIAG_STEREO`'s output) showed 94–99% grid
+  coverage and hundreds of valid-depth points for *every* phase, including the extremes.
+- **Not blur or noise in the expected direction.** A sharpness diagnostic
+  (`ORBSLAM_DIAG_SHARPNESS`, new, in `stereo_general.cc`) showed dark frames with the
+  *lowest* Laplacian variance and bright frames the *highest* — the reverse of the
+  naive "long exposure → blur, short exposure → noise" prediction.
+- **Not map corruption from a bad keyframe.** `ORBSLAM_DIAG_KF` (new) showed keyframes
+  created during the bad stretch had normal-to-good point counts and spread; post-stretch
+  quality metrics didn't degrade.
+- **Not the same-phase fallback.** `trackMethod` stayed `motion_model` throughout the worst
+  window — ordinary tracking, not a fallback/relocalization path, was producing the drift.
+- A visible discrete "jump" in the trajectory overlay traced to one frame (dark-phase,
+  `id=633` in the diagnostic run) whose *own* extracted keypoints looked completely normal
+  by every above metric, yet whose `TrackLocalMap` match count and post-optimization inlier
+  count were roughly half its neighbors' (189 matches/128 inliers vs. neighbors' 270–400/
+  280–450) — pointing at the local-map *matching* step itself, not the frame's own image.
+
+**Root cause**: `MapPoint::GetDescriptor(phase)` (§5) falls back to the general,
+all-observations descriptor whenever a point has no observation from the query phase.
+Under the dark→mid→bright→mid cycle, the mid phase occupies 2 of 4 nominal slots, so dark
+and bright are structurally "minority" phases — any given point gets far fewer chances to
+ever be observed *during* a dark or bright frame, so `mDescriptorByPhase[0]`/`[2]` stays
+empty far longer than `[1]` does. A new diagnostic, `ORBSLAM_DIAG_PHASEDESC` (prints
+`PHASE_DESC id=... phase=... nmatches=... withPhaseDesc=... withoutPhaseDesc=...` from
+`ORBmatcher::SearchByProjection`, plus `MapPoint::HasPhaseDescriptor(phase)` to detect the
+fallback without changing `GetDescriptor`'s behavior), confirmed this run-wide, not just at
+the one visible spike: dark/bright frames fall back to the compromise descriptor 44–49% of
+the time vs. mid's 32%, and `fallbackRate` correlates with `nmatches` at **r=−0.52** and
+with `mnMatchesInliers` at **r=−0.50** across the whole run (1227 frames). Critically, the
+*inlier rate* (inliers ÷ total matches) is flat across phases at ~89% — matches that are
+found are just as likely to be correct. The problem is **yield**, not correctness: dark and
+bright frames systematically start pose optimization with fewer, less-constraining
+correspondences, producing a small precision penalty on every one of their frames that
+compounds into visible drift over hundreds of frames, without any single frame ever looking
+obviously bad by count alone. Classical AE never pays this cost since it has only one phase,
+so every observation of every point counts toward its one descriptor.
+
+Two fixes, in `src/MapPoint.cc` and `src/Tracking.cc`:
+
+1. **Widened descriptor fallback** (`MapPoint::GetDescriptor(int phase)`): before falling
+   all the way to the general compromise descriptor, try the *other* minority phase's own
+   descriptor (dark↔bright) if it has one. BRIEF/ORB descriptors compare relative (ordinal)
+   pixel-pair intensities within a patch specifically to be robust to global brightness
+   shifts, so a genuinely dark-phase-specific descriptor should still resemble a
+   bright-phase query better than a mid-dominated average would.
+2. **Keyframe match-yield gate** (`Tracking::CreateNewKeyFrame()`): a single, non-phase-keyed
+   trailing history of the last 20 frames' `mnMatchesInliers` (`Tracking::mRecentMatchesInliers`,
+   updated unconditionally in `TrackLocalMap()`). If a keyframe's own inlier count is below
+   `ORBSLAM_KF_YIELD_MIN_RATIO` (default 0.4) of the trailing median, skip triangulating
+   *new* MapPoints from it — existing points, the `KeyFrame` object itself,
+   `mpReferenceKF(ByPhase)`, and all per-phase tracking state are untouched, so a
+   low-yield frame still contributes to tracking continuity, it just doesn't get to permanently
+   seed new, less-precisely-triangulated points into the map.
+
+Both fixes were explicitly checked against the reverted velocity-guard's failure mode (a
+per-phase state cascade — see §5's "Net measured effect" history): neither reads or writes
+`mVelocity(ByPhase)` or anything the same-phase fallback chain consumes, and the one new
+piece of state (`mRecentMatchesInliers`) is a single instance shared across all phases, so
+there's no per-phase partition of it to selectively starve.
+
+**Measured effect** (`stair_bracketing`, RPE vs. LiDAR ground truth,
+`tools/bracketing_diag/compute_rpe.py`):
+
+| | before | after |
+|---|---|---|
+| Translational RPE RMSE | 0.256 m | 0.235 m |
+| Translational RPE max | **1.75 m** | **0.62 m** |
+| Rotational RPE RMSE | 3.04° | 3.11° |
+| Rotational RPE max | 13.4° | 12.4° |
+| Final spurious height drift | ≈−2.8 m | ≈−0.24 m |
+| Resets | 0 | 0 |
+
+Neutrality confirmed on `stair_ae` (single-phase dataset — fix 1 is a structural no-op
+there, fix 2 exercised but harmless): RPE unchanged within noise (0.227m→0.227m RMSE). No
+regression on the July 18 tunnel dataset: still zero resets, one unified map, fail count
+(64) within the previously-validated 37–169 range.
+
+## 7. Diagnostic instrumentation (env-var gated, zero cost when unset)
 
 All read once via `getenv(...)` into a `static const` — no measurable overhead when the
 variable isn't set, no signature changes, and safe to leave permanently in the tree.
@@ -295,10 +390,16 @@ variable isn't set, no signature changes, and safe to leave permanently in the t
 |---|---|---|
 | `ORBSLAM_LOG_FRAMES=1` | `stereo_general.cc` | `FRAME ni=<index> ts_ns=<timestamp>` per frame |
 | `ORBSLAM_DUMP_FRAMES_DIR=<dir>` (+ `_START_NS`/`_END_NS`) | `stereo_general.cc` | writes annotated frame PNGs for offline video export |
-| `ORBSLAM_DIAG_STEREO=1` | `Frame::ComputeStereoMatches` | `STEREO_MATCH phase=... N=... validDepth=... candidateDisparities=... ts=...` per frame. Note `phase` always prints `-1` here — `mnExposurePhase` is set *after* the `Frame` constructor returns, so correlating this line to a phase requires an external join on `ts` against the metadata CSV. |
+| `ORBSLAM_DIAG_STEREO=1` | `Frame::ComputeStereoMatches` | `STEREO_MATCH phase=... N=... validDepth=... candidateDisparities=... gridOccupied=... gridTotal=... bboxFracX=... bboxFracY=... ts=...` per frame. Note `phase` always prints `-1` here — `mnExposurePhase` is set *after* the `Frame` constructor returns, so correlating this line to a phase requires an external join on `ts` against the metadata CSV. `gridOccupied`/`bboxFrac*` (§6) measure spatial spread of valid-depth keypoints. |
 | `ORBSLAM_DIAG_SAMEPHASE=1` | `TrackReferenceKeyFrameSamePhase`, `TrackWithMotionModelSamePhase` | `SAMEPHASE_RKF`/`SAMEPHASE_MM`/`SAMEPHASE_MM_RESULT` with `nmatches`/`nmatchesMap`/`refAgeSec`/`refMPs` |
+| `ORBSLAM_DIAG_TRACKMETHOD=1` | `Tracking::Track()` | `TRACK_METHOD id=... method=... state=... phase=... transJump=... rotJumpDeg=... ts=...` per accepted frame — which function produced the pose, and the raw frame-to-frame pose delta. |
+| `ORBSLAM_DIAG_SHARPNESS=1` | `stereo_general.cc` | `SHARPNESS ni=... phase=... lapVarLeft=... lapVarRight=... meanIntensityLeft=... ts_ns=...` — blur (Laplacian variance) and brightness of the raw captured image, before any rectification. |
+| `ORBSLAM_DIAG_KF=1` | `Tracking::CreateNewKeyFrame()` | `NEW_KF id=... phase=... nNewPoints=... nReusedPoints=... ts=...` |
+| `ORBSLAM_DIAG_PHASEDESC=1` | `ORBmatcher::SearchByProjection(Frame&, ...)`, `Tracking::TrackLocalMap()` | `PHASE_DESC id=... phase=... nmatches=... withPhaseDesc=... withoutPhaseDesc=... ts=...` and `TLM_INLIERS id=... phase=... nMatchedTotal=... mnMatchesInliers=... ts=...` — see §6. |
+| `ORBSLAM_KF_YIELD_MIN_RATIO=<float>` | `Tracking::CreateNewKeyFrame()` | Not a diagnostic — tunes §6's keyframe match-yield gate threshold (default 0.4) without a rebuild. |
+| `ORBSLAM_KF_BURST=1` | `Tracking::NeedNewKeyFrame()`/`CreateNewKeyFrame()` | **Experimental, off by default, not shipped** — see §9. |
 
-## 7. Module-level summary (quick reference)
+## 8. Module-level summary (quick reference)
 
 | Module | New/Modified | One-line summary |
 |---|---|---|
@@ -309,16 +410,17 @@ variable isn't set, no signature changes, and safe to leave permanently in the t
 | `tools/bracketing_diag/` | New (untracked) | Ad-hoc analysis scripts, run logs, and videos accumulated while diagnosing the tunnel-exit break (not part of the shipped fix) |
 | `include/Frame.h`, `src/Frame.cc` | Modified | `mnExposurePhase` tag; stereo sub-pixel confidence gate (root-cause fix, §4); `ORBSLAM_DIAG_STEREO` |
 | `include/KeyFrame.h`, `src/KeyFrame.cc` | Modified | `mnExposurePhase` tag, propagated from constituent `Frame` |
-| `include/MapPoint.h`, `src/MapPoint.cc` | Modified | Per-phase representative descriptor (`mDescriptorByPhase`) + `GetDescriptor(phase)` |
-| `src/ORBmatcher.cc` | Modified | `SearchByProjection` (local-map variant) uses phase-aware descriptor lookup |
+| `include/MapPoint.h`, `src/MapPoint.cc` | Modified | Per-phase representative descriptor (`mDescriptorByPhase`) + `GetDescriptor(phase)`; widened dark↔bright fallback + `HasPhaseDescriptor(phase)` (§6) |
+| `src/ORBmatcher.cc` | Modified | `SearchByProjection` (local-map variant) uses phase-aware descriptor lookup; `ORBSLAM_DIAG_PHASEDESC` (§6) |
 | `include/System.h`, `src/System.cc` | Modified | `TrackStereo(..., exposurePhase)`; new `GetFrameDrawerImage()` accessor for headless viewer capture |
-| `include/Tracking.h`, `src/Tracking.cc` | Modified | Phase-tag threading; per-phase last-frame/reference-KF/velocity state; `TrackReferenceKeyFrameSamePhase`/`TrackWithMotionModelSamePhase`/`TrySamePhaseFallback`; wired into `Track()`'s steady-state fallback and `RECENTLY_LOST` recovery; `time_recently_lost` unification |
+| `include/Tracking.h`, `src/Tracking.cc` | Modified | Phase-tag threading; per-phase last-frame/reference-KF/velocity state; `TrackReferenceKeyFrameSamePhase`/`TrackWithMotionModelSamePhase`/`TrySamePhaseFallback`; wired into `Track()`'s steady-state fallback and `RECENTLY_LOST` recovery; `time_recently_lost` unification; keyframe match-yield gate + `mRecentMatchesInliers` (§6); `ORBSLAM_KF_BURST` experiment (§9, not shipped) |
 | `src/FrameDrawer.cc` | Modified | Stereo-depth-outcome debug overlay (yellow/red); `RECENTLY_LOST` render branch (§3) |
 | `src/Settings.cc` | Modified | Fixed wrong image size passed to `cv::stereoRectify` when downsampling (unrelated bug fix) |
 | `CMakeLists.txt` | Modified | C++14, OpenCV 4.2, new executable targets |
 | `docker/`, `.devcontainer/` | New/modified | Dev environment: prebuilt-Pangolin image, fast entrypoint, VS Code devcontainer |
+| `tools/bracketing_diag/compute_rpe.py`, `analyze_phase_quality.py` | New | RPE-vs-ground-truth evaluation; per-phase match-quality analysis (§6) |
 
-## 8. Explicitly considered and NOT done
+## 9. Explicitly considered and NOT done
 
 - **Deep-learning stereo matching** (WAFT-Stereo / RAFT-Stereo) — researched and
   architecturally scoped (the codebase's existing `ComputeStereoFromRGBD` dense-depth
@@ -334,3 +436,27 @@ variable isn't set, no signature changes, and safe to leave permanently in the t
 - **Zero-mean SAD stereo matching** — implemented, found to address a brightness-
   mismatch problem this rig doesn't have (L/R cameras are always exposure-synced),
   reverted.
+- **Velocity-guard on same-phase-fallback frames** (§6 investigation) — suppressing
+  `mVelocity(ByPhase)` updates after a stale-reference recovery, intended to stop that
+  frame's position error from being extrapolated forward. Reverted: because a hard
+  stretch cycles through all phases every frame, this starved `mbVelocityByPhase` for
+  *all four phases* within a few frames, collapsing the whole fallback chain down to
+  raw `Relocalization()` (no temporal continuity), which oscillated for 37 consecutive
+  frames between two ~6m-apart candidate poses. The postmortem comment lives directly
+  in `Tracking.cc`'s velocity-update block and shaped how §6's two fixes were
+  deliberately designed (single, non-phase-keyed state only) to avoid the same cascade.
+- **Unconditional keyframe burst** (`ORBSLAM_KF_BURST`, still in the tree, off by
+  default) — forcing every keyframe decision to also promote the rest of the current
+  bracket cycle to keyframes. A refined, recovery-triggered-only variant measurably
+  improved both early-segment straightness and tunnel-exit smoothness in a truncated-
+  dataset test, but was superseded by §6's more targeted, better-evidenced fix before
+  going through full-dataset validation — left as an unshipped experiment rather than
+  deleted, in case future data suggests reviving it.
+- **Replacing ORB with a learned feature detector/descriptor** (e.g. SuperPoint/DISK) —
+  considered when discussing §6's findings. Not pursued: §6 showed the *inlier rate*
+  or matched keypoints is unaffected by exposure phase (~89% flat across phases) — the
+  problem is per-phase descriptor *coverage*, not descriptor *quality* — so a better
+  descriptor wouldn't target the actual mechanism. Would also require CUDA/inference
+  runtime infrastructure this project doesn't have (same gap as the deep-learning
+  stereo option above) and touch the BoW vocabulary and Hamming-distance matching
+  throughout the codebase, a much larger change than anything else in this document.

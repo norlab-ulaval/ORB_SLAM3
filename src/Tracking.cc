@@ -1925,6 +1925,9 @@ void Tracking::Track()
     {
         // System is initialized. Track Frame.
         bool bOK;
+        // Diagnostic (ORBSLAM_DIAG_TRACKMETHOD): which function actually produced this
+        // frame's pose, so trajectory jumps can be correlated against method switches.
+        const char* trackMethod = "none";
 
 #ifdef REGISTER_TIMES
         std::chrono::steady_clock::time_point time_StartPosePred = std::chrono::steady_clock::now();
@@ -1947,13 +1950,18 @@ void Tracking::Track()
                 {
                     Verbose::PrintMess("TRACK: Track with respect to the reference KF ", Verbose::VERBOSITY_DEBUG);
                     bOK = TrackReferenceKeyFrame();
+                    trackMethod = "ref_kf";
                 }
                 else
                 {
                     Verbose::PrintMess("TRACK: Track with motion model", Verbose::VERBOSITY_DEBUG);
                     bOK = TrackWithMotionModel();
+                    trackMethod = "motion_model";
                     if(!bOK)
+                    {
                         bOK = TrackReferenceKeyFrame();
+                        trackMethod = "ref_kf";
+                    }
                 }
 
                 // Same-phase/cross-phase fallback: ordinary tracking already tried the
@@ -1964,7 +1972,10 @@ void Tracking::Track()
                 // tunnel exit), where the adjacent (possibly differently-exposed) frame
                 // fails outright but a same/other-phase frame is still a good match.
                 if(!bOK)
+                {
                     bOK = TrySamePhaseFallback();
+                    trackMethod = "samephase";
+                }
 
                 if (!bOK)
                 {
@@ -2021,11 +2032,13 @@ void Tracking::Track()
                         // stretch), so it can recover mid-transient the moment a well-exposed
                         // frame of any phase reappears, without needing prior map coverage.
                         bOK = TrySamePhaseFallback();
+                        trackMethod = "samephase_rl";
 
                         if(!bOK)
                         {
                             // Relocalization
                             bOK = Relocalization();
+                            trackMethod = "relocalization";
                         }
                         //std::cout << "mCurrentFrame.mTimeStamp:" << to_string(mCurrentFrame.mTimeStamp) << std::endl;
                         //std::cout << "mTimeStampLost:" << to_string(mTimeStampLost) << std::endl;
@@ -2236,6 +2249,35 @@ void Tracking::Track()
                 Sophus::SE3f LastTwc = mLastFrame.GetPose().inverse();
                 mVelocity = mCurrentFrame.GetPose() * LastTwc;
                 mbVelocity = true;
+
+                // Diagnostic (ORBSLAM_DIAG_TRACKMETHOD): which function produced this
+                // frame's pose, and the resulting frame-to-frame translation/rotation
+                // delta, to correlate trajectory jumps against method switches.
+                //
+                // Tried and REJECTED here: suppressing this update (and the matching
+                // per-phase one below) whenever trackMethod came from the same-phase
+                // fallback, on the theory that a stale-reference recovery's position
+                // error shouldn't get extrapolated into the next frame's prediction.
+                // That made things measurably worse: gating the PER-PHASE velocity the
+                // same way starves mbVelocityByPhase for every phase in turn during any
+                // multi-frame difficult stretch (phases cycle every frame, so one
+                // untrusted frame per phase is enough to knock out all four within a
+                // few frames) -- degrading TrySamePhaseFallback down to raw
+                // Relocalization(), which has no temporal continuity constraint at all.
+                // Confirmed on the tunnel-exit window: 37 consecutive frames (ids
+                // 667-703) stuck oscillating between two ~6m-apart candidate poses.
+                // This is the same bug class as the mbVelocityByPhase clear-on-failure
+                // issue fixed earlier -- just reachable via a different trigger.
+                static const bool bDiagTrackMethod = (getenv("ORBSLAM_DIAG_TRACKMETHOD") != nullptr);
+                if(bDiagTrackMethod)
+                {
+                    const float transJump = mVelocity.translation().norm();
+                    const float rotJumpDeg = mVelocity.so3().log().norm() * 180.0 / M_PI;
+                    cout << "TRACK_METHOD id=" << mCurrentFrame.mnId << " method=" << trackMethod
+                         << " state=" << mState << " phase=" << mCurrentFrame.mnExposurePhase
+                         << " transJump=" << transJump << " rotJumpDeg=" << rotJumpDeg
+                         << " ts=" << (long long)llround(mCurrentFrame.mTimeStamp*1e9) << endl;
+                }
             }
             else {
                 mbVelocity = false;
@@ -2301,7 +2343,26 @@ void Tracking::Track()
             // if(bNeedKF && bOK)
             if(bNeedKF && (bOK || (mInsertKFsLost && mState==RECENTLY_LOST &&
                                    (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD))))
+            {
                 CreateNewKeyFrame();
+
+                static const bool bKFBurstEnabled = (getenv("ORBSLAM_KF_BURST") != nullptr);
+                if(bKFBurstEnabled && mSensor==System::STEREO && mCurrentFrame.mnExposurePhase>=0)
+                {
+                    if(mnKFBurstFramesRemaining>0)
+                        mnKFBurstFramesRemaining--;
+                    else if(trackMethod != std::string("motion_model"))
+                        // Only arm a NEW burst window off the back of a keyframe that
+                        // itself came from a difficult recovery path (ref_kf/samephase/
+                        // samephase_rl/relocalization), not routine ordinary tracking --
+                        // measured on the tunnel-region dataset: bursting unconditionally
+                        // on every ordinary keyframe decision throughout the easy portions
+                        // of the run measurably added lateral wiggle there (early-segment
+                        // straight-line noise nearly doubled, 6cm to 12cm std) for no
+                        // benefit, since that's not where the coverage gap actually is.
+                        mnKFBurstFramesRemaining = NUM_EXPOSURE_PHASES - 1;
+                }
+            }
 
 #ifdef REGISTER_TIMES
             std::chrono::steady_clock::time_point time_EndNewKF = std::chrono::steady_clock::now();
@@ -3264,6 +3325,32 @@ bool Tracking::TrackLocalMap()
         }
     }
 
+    // Diagnostic (ORBSLAM_DIAG_PHASEDESC=1): final post-optimization inlier count for
+    // this frame, to correlate against ORBmatcher's PHASE_DESC line (same ts) -- lets
+    // an analysis join "how many local-map matches used a phase-mismatched compromise
+    // descriptor" against "how many of this frame's matches survived pose optimization
+    // as geometric inliers", to test whether phase-descriptor fallback quietly biases
+    // the pose solve without reducing raw match count.
+    {
+        static const bool bDiagPhaseDesc = (getenv("ORBSLAM_DIAG_PHASEDESC") != nullptr);
+        if(bDiagPhaseDesc)
+        {
+            cout << "TLM_INLIERS id=" << mCurrentFrame.mnId << " phase=" << mCurrentFrame.mnExposurePhase
+                 << " nMatchedTotal=" << aux1 << " mnMatchesInliers=" << mnMatchesInliers
+                 << " ts=" << (long long)llround(mCurrentFrame.mTimeStamp*1e9) << endl;
+        }
+    }
+
+    // See mRecentMatchesInliers's declaration. Updated unconditionally here (not
+    // gated on this call's eventual true/false return below) -- it's an ambient "how
+    // much has recent tracking typically had to work with" signal, not a
+    // success/failure-conditioned one.
+    {
+        mRecentMatchesInliers.push_back(mnMatchesInliers);
+        if(mRecentMatchesInliers.size()>20)
+            mRecentMatchesInliers.pop_front();
+    }
+
     // Decide if the tracking was succesful
     // More restrictive if there was a relocalization recently
     mpLocalMapper->mnMatchesInliers=mnMatchesInliers;
@@ -3324,6 +3411,13 @@ bool Tracking::NeedNewKeyFrame()
         }*/
         return false;
     }
+
+    // Experiment (ORBSLAM_KF_BURST): once an ordinary decision below fires for one
+    // phase, force the rest of the current bracket cycle to become keyframes too
+    // (see mnKFBurstFramesRemaining / Track()'s CreateNewKeyFrame() call site).
+    static const bool bKFBurstEnabled = (getenv("ORBSLAM_KF_BURST") != nullptr);
+    if(bKFBurstEnabled && mnKFBurstFramesRemaining>0 && mCurrentFrame.mnExposurePhase>=0)
+        return true;
 
     const int nKFs = mpAtlas->KeyFramesInMap();
 
@@ -3517,7 +3611,40 @@ void Tracking::CreateNewKeyFrame()
         {
             sort(vDepthIdx.begin(),vDepthIdx.end());
 
+            // Skip seeding brand-new MapPoints from this keyframe if its own match
+            // yield (mnMatchesInliers, just set by TrackLocalMap) is unusually low
+            // relative to recent typical yield -- a low-yield frame's pose is less
+            // well-constrained, so points it triangulates carry that extra imprecision
+            // permanently into the map. Diagnosed on the July 31 stair dataset:
+            // dark/bright bracket phases structurally get fewer local-map match
+            // opportunities than mid (mid occupies 2 of 4 nominal cycle slots),
+            // correlating run-wide with lower mnMatchesInliers for those phases
+            // specifically (r=-0.50) -- not because matches are wrong (inlier rate is
+            // flat across phases, ~89%), but because fewer are found to begin with,
+            // giving pose optimization less to work with. Fixing this (together with
+            // the widened per-phase descriptor fallback in MapPoint::GetDescriptor)
+            // measurably reduced trajectory error -- see docs/MODIFICATIONS.md. Only
+            // ever skips NEW point creation below; existing points, the KeyFrame
+            // object, mpReferenceKF(ByPhase), and all per-phase tracking state are
+            // untouched -- same safety pattern as the tunnel-exit confidence gate,
+            // deliberately checked against the reverted velocity-guard's
+            // per-phase-starvation cascade: mRecentMatchesInliers is a single,
+            // non-phase-keyed trailing history, so there is no per-phase partition of
+            // it to selectively starve.
+            static const float fKFYieldMinRatio = getenv("ORBSLAM_KF_YIELD_MIN_RATIO") ?
+                (float)atof(getenv("ORBSLAM_KF_YIELD_MIN_RATIO")) : 0.4f;
+            bool bSkipNewPoints = false;
+            if(mRecentMatchesInliers.size()>=5)
+            {
+                vector<int> vSortedRecent(mRecentMatchesInliers.begin(), mRecentMatchesInliers.end());
+                sort(vSortedRecent.begin(), vSortedRecent.end());
+                const int trailingMedian = vSortedRecent[vSortedRecent.size()/2];
+                if(trailingMedian>0 && mnMatchesInliers < fKFYieldMinRatio*trailingMedian)
+                    bSkipNewPoints = true;
+            }
+
             int nPoints = 0;
+            int nNewPoints = 0, nReusedPoints = 0;
             for(size_t j=0; j<vDepthIdx.size();j++)
             {
                 int i = vDepthIdx[j].second;
@@ -3532,6 +3659,9 @@ void Tracking::CreateNewKeyFrame()
                     bCreateNew = true;
                     mCurrentFrame.mvpMapPoints[i] = static_cast<MapPoint*>(NULL);
                 }
+
+                if(bSkipNewPoints)
+                    bCreateNew = false;
 
                 if(bCreateNew)
                 {
@@ -3562,10 +3692,12 @@ void Tracking::CreateNewKeyFrame()
 
                     mCurrentFrame.mvpMapPoints[i]=pNewMP;
                     nPoints++;
+                    nNewPoints++;
                 }
                 else
                 {
                     nPoints++;
+                    nReusedPoints++;
                 }
 
                 if(vDepthIdx[j].first>mThDepth && nPoints>maxPoint)
@@ -3574,6 +3706,21 @@ void Tracking::CreateNewKeyFrame()
                 }
             }
             //Verbose::PrintMess("new mps for stereo KF: " + to_string(nPoints), Verbose::VERBOSITY_NORMAL);
+
+            // Diagnostic (ORBSLAM_DIAG_KF=1): how many brand-new MapPoints this
+            // KeyFrame just triangulated vs. how many it only added an observation
+            // to (already validated by an earlier KeyFrame). Used to check whether a
+            // KeyFrame created from a poorly-conditioned frame (few/clustered points,
+            // see ORBSLAM_DIAG_STEREO's gridOccupied) actually gets to seed new map
+            // points, and whether any resulting degradation persists past the frame
+            // itself (map corruption) rather than being purely transient.
+            static const bool bDiagKF = (getenv("ORBSLAM_DIAG_KF") != nullptr);
+            if(bDiagKF)
+            {
+                cout << "NEW_KF id=" << mCurrentFrame.mnId << " phase=" << mCurrentFrame.mnExposurePhase
+                     << " nNewPoints=" << nNewPoints << " nReusedPoints=" << nReusedPoints
+                     << " ts=" << (long long)llround(mCurrentFrame.mTimeStamp*1e9) << endl;
+            }
         }
     }
 
@@ -4084,6 +4231,8 @@ void Tracking::Reset(bool bLocMap)
         mpReferenceKFByPhase[i] = static_cast<KeyFrame*>(NULL);
         mbVelocityByPhase[i] = false;
     }
+    mnKFBurstFramesRemaining = 0;
+    mRecentMatchesInliers.clear();
 
     if(mpViewer)
         mpViewer->Release();
@@ -4183,6 +4332,8 @@ void Tracking::ResetActiveMap(bool bLocMap)
         mpReferenceKFByPhase[i] = static_cast<KeyFrame*>(NULL);
         mbVelocityByPhase[i] = false;
     }
+    mnKFBurstFramesRemaining = 0;
+    mRecentMatchesInliers.clear();
 
     if(mpViewer)
         mpViewer->Release();

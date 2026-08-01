@@ -41,6 +41,7 @@
 
 #include <mutex>
 #include <unordered_set>
+#include <deque>
 
 namespace ORB_SLAM3
 {
@@ -305,6 +306,14 @@ protected:
     KeyFrame* mpReferenceKFByPhase[NUM_EXPOSURE_PHASES] = {nullptr,nullptr,nullptr,nullptr};
     std::vector<KeyFrame*> mvpLocalKeyFrames;
     std::vector<MapPoint*> mvpLocalMapPoints;
+
+    // Experiment (ORBSLAM_KF_BURST): counts down the remaining frames of the current
+    // bracket cycle that should also become keyframes once an ordinary NeedNewKeyFrame()
+    // decision fires for one of them -- see NeedNewKeyFrame()/Track(). Goal: give every
+    // exposure phase a fresh keyframe close in time to the others (denser, more balanced
+    // local map coverage during a hard transient) instead of only the one phase whose
+    // frame happened to trigger the decision.
+    int mnKFBurstFramesRemaining = 0;
     
     // System
     System* mpSystem;
@@ -346,6 +355,15 @@ protected:
 
     //Current matches in frame
     int mnMatchesInliers;
+
+    // Experiment (ORBSLAM_KF_YIELD_GATE): trailing history of recent mnMatchesInliers
+    // values, updated unconditionally on every TrackLocalMap() call regardless of
+    // phase or outcome -- deliberately a single, non-phase-keyed instance (see the
+    // reverted velocity-guard's per-phase starvation postmortem in Track() for why
+    // per-phase state here would be dangerous). Used by CreateNewKeyFrame() to skip
+    // seeding new MapPoints from a frame whose own match yield is unusually low
+    // relative to recent typical yield, without touching any tracking-time state.
+    std::deque<int> mRecentMatchesInliers;
 
     //Last Frame, KeyFrame and Relocalisation Info
     KeyFrame* mpLastKeyFrame;

@@ -908,6 +908,30 @@ void Frame::ComputeStereoMatches()
             const int w = 5;
             cv::Mat IL = mpORBextractorLeft->mvImagePyramid[kpL.octave].rowRange(scaledvL-w,scaledvL+w+1).colRange(scaleduL-w,scaleduL+w+1);
 
+            // Region-level saturation gate: reject this keypoint's depth outright if
+            // its own local patch is mostly saturated. A saturated patch's raw-SAD
+            // cost curve goes nearly flat across all candidate shifts (every pixel
+            // pair reads ~255-255=0 regardless of alignment), which can slip past the
+            // confidence-ratio gate below in the degenerate case where both the best
+            // and second-best scores are near zero -- "ambiguous because everything
+            // looks equally perfect" isn't caught by a ratio test the same way
+            // "ambiguous because several shifts score similarly" is. This is a
+            // per-keypoint, per-patch check -- unlike a whole-frame skip (tried and
+            // measured net-negative: discarding an entire frame just shifts the
+            // problem into a bigger gap for the next frame to bridge, see
+            // docs/MODIFICATIONS.md), a keypoint sitting in a blown-out corner is
+            // rejected while the rest of an otherwise-fine frame's keypoints are
+            // untouched.
+            static const bool bStereoSatGateEnabled = (getenv("ORBSLAM_STEREO_SAT_GATE") != nullptr);
+            static const float fStereoSatMaxFrac = getenv("ORBSLAM_STEREO_SAT_MAX_FRAC") ?
+                (float)atof(getenv("ORBSLAM_STEREO_SAT_MAX_FRAC")) : 0.5f;
+            if(bStereoSatGateEnabled)
+            {
+                const int nSatPix = cv::countNonZero(IL >= 250);
+                if((float)nSatPix / IL.total() > fStereoSatMaxFrac)
+                    continue;
+            }
+
             int bestDist = INT_MAX;
             int bestincR = 0;
             const int L = 5;
@@ -1011,11 +1035,42 @@ void Frame::ComputeStereoMatches()
     if(bDiagStereo)
     {
         int nValidDepth = 0;
+        // Spatial spread of the valid-depth keypoints, to distinguish "few but
+        // well-distributed" from "few AND clustered" (the latter makes the pose
+        // solve poorly-constrained/degenerate even when each point's own depth is
+        // confident -- something the SAD confidence gate above cannot detect, since
+        // it only looks at one keypoint's match quality at a time). Grid occupancy
+        // is the load-bearing metric here: unlike a bounding box, it isn't fooled by
+        // two far-apart isolated points into looking well-spread.
+        const int GRID_COLS = 4, GRID_ROWS = 3;
+        bool gridCell[GRID_ROWS][GRID_COLS] = {{false}};
+        float minPX=1e9f, maxPX=-1e9f, minPY=1e9f, maxPY=-1e9f;
         for(int i=0;i<N;i++)
-            if(mvDepth[i]>0) nValidDepth++;
+        {
+            if(mvDepth[i]<=0)
+                continue;
+            nValidDepth++;
+            const float px = mvKeysUn[i].pt.x, py = mvKeysUn[i].pt.y;
+            if(px<minPX) minPX=px; if(px>maxPX) maxPX=px;
+            if(py<minPY) minPY=py; if(py>maxPY) maxPY=py;
+            int col = (int)((px-mnMinX)/(mnMaxX-mnMinX)*GRID_COLS);
+            int row = (int)((py-mnMinY)/(mnMaxY-mnMinY)*GRID_ROWS);
+            col = std::min(std::max(col,0),GRID_COLS-1);
+            row = std::min(std::max(row,0),GRID_ROWS-1);
+            gridCell[row][col] = true;
+        }
+        int gridOccupied = 0;
+        for(int r=0;r<GRID_ROWS;r++)
+            for(int c=0;c<GRID_COLS;c++)
+                if(gridCell[r][c]) gridOccupied++;
+        const float bboxFracX = (nValidDepth>0) ? (maxPX-minPX)/(mnMaxX-mnMinX) : 0.f;
+        const float bboxFracY = (nValidDepth>0) ? (maxPY-minPY)/(mnMaxY-mnMinY) : 0.f;
+
         cout << "STEREO_MATCH phase=" << mnExposurePhase << " N=" << N
              << " validDepth=" << nValidDepth
              << " candidateDisparities=" << vDistIdx.size()
+             << " gridOccupied=" << gridOccupied << " gridTotal=" << (GRID_ROWS*GRID_COLS)
+             << " bboxFracX=" << bboxFracX << " bboxFracY=" << bboxFracY
              << " ts=" << (long long)llround(mTimeStamp*1e9) << endl;
     }
 }

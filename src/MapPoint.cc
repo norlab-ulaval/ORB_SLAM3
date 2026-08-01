@@ -457,7 +457,38 @@ cv::Mat MapPoint::GetDescriptor(int phase)
     unique_lock<mutex> lock(mMutexFeatures);
     if(phase >= 0 && phase < NUM_EXPOSURE_PHASES && !mDescriptorByPhase[phase].empty())
         return mDescriptorByPhase[phase].clone();
+
+    // Widened fallback: under this fork's ascending-exposure-value phase bucketing,
+    // phase 0 is the darkest bracket exposure and phase 2 is the brightest, each a
+    // "minority" phase that gets far fewer observation opportunities than the mid
+    // phase (which occupies 2 of 4 nominal cycle slots) -- so their own per-phase
+    // descriptor is empty far more often, forcing every query to fall all the way to
+    // the general (all-observations, mid-dominated) compromise descriptor. Measured
+    // on the July 31 stair dataset: this correlates with a real, run-wide drop in
+    // local-map match *yield* for phase 0/2 queries (not match *correctness* --
+    // inlier rate is unaffected at ~89% for all phases, only raw count drops), and
+    // fixing it measurably reduced trajectory error (see docs/MODIFICATIONS.md).
+    // Before falling all the way to the compromise, try the OTHER minority phase's
+    // own descriptor: BRIEF/ORB descriptors compare relative (ordinal) pixel-pair
+    // intensities within a patch specifically to be robust to global brightness
+    // shifts, so a genuinely dark-phase-specific descriptor should still resemble a
+    // bright-phase query more closely than a mid-dominated average would, for a point
+    // neither extreme phase has itself observed via its own descriptor slot.
+    {
+        int altPhase = -1;
+        if(phase==0) altPhase = 2;
+        else if(phase==2) altPhase = 0;
+        if(altPhase>=0 && altPhase<NUM_EXPOSURE_PHASES && !mDescriptorByPhase[altPhase].empty())
+            return mDescriptorByPhase[altPhase].clone();
+    }
+
     return mDescriptor.clone();
+}
+
+bool MapPoint::HasPhaseDescriptor(int phase)
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return phase >= 0 && phase < NUM_EXPOSURE_PHASES && !mDescriptorByPhase[phase].empty();
 }
 
 tuple<int,int> MapPoint::GetIndexInKeyFrame(KeyFrame *pKF)

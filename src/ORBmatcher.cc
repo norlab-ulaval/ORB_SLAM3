@@ -20,6 +20,8 @@
 #include "ORBmatcher.h"
 
 #include<limits.h>
+#include<cmath>
+#include<iostream>
 
 #include<opencv2/core/core.hpp>
 
@@ -43,6 +45,17 @@ namespace ORB_SLAM3
     int ORBmatcher::SearchByProjection(Frame &F, const vector<MapPoint*> &vpMapPoints, const float th, const bool bFarPoints, const float thFarPoints)
     {
         int nmatches=0, left = 0, right = 0;
+
+        // Diagnostic (ORBSLAM_DIAG_PHASEDESC=1): how many of this call's local-map
+        // matches used the query frame's own phase-specific MapPoint descriptor vs.
+        // fell back to the general (all-observations) one, because this MapPoint has
+        // never actually been observed from the query frame's phase. A high fallback
+        // rate for a bracket-extreme-phase query means TrackLocalMap is matching
+        // against a lot of phase-mismatched "compromise" descriptors -- which
+        // wouldn't reduce match count, but could quietly bias which correspondences
+        // get picked, without tripping any existing outlier check.
+        static const bool bDiagPhaseDesc = (getenv("ORBSLAM_DIAG_PHASEDESC") != nullptr);
+        int nMatchedWithPhaseDesc = 0, nMatchedWithoutPhaseDesc = 0;
 
         const bool bFactor = th!=1.0;
 
@@ -128,6 +141,14 @@ namespace ORB_SLAM3
                         if(bestLevel!=bestLevel2 || bestDist<=mfNNratio*bestDist2){
                             F.mvpMapPoints[bestIdx]=pMP;
 
+                            if(bDiagPhaseDesc)
+                            {
+                                if(pMP->HasPhaseDescriptor(F.mnExposurePhase))
+                                    nMatchedWithPhaseDesc++;
+                                else
+                                    nMatchedWithoutPhaseDesc++;
+                            }
+
                             if(F.Nleft != -1 && F.mvLeftToRightMatch[bestIdx] != -1){ //Also match with the stereo observation at right camera
                                 F.mvpMapPoints[F.mvLeftToRightMatch[bestIdx] + F.Nleft] = pMP;
                                 nmatches++;
@@ -209,6 +230,16 @@ namespace ORB_SLAM3
                 }
             }
         }
+
+        if(bDiagPhaseDesc)
+        {
+            cout << "PHASE_DESC id=" << F.mnId << " phase=" << F.mnExposurePhase
+                 << " nmatches=" << nmatches
+                 << " withPhaseDesc=" << nMatchedWithPhaseDesc
+                 << " withoutPhaseDesc=" << nMatchedWithoutPhaseDesc
+                 << " ts=" << (long long)llround(F.mTimeStamp*1e9) << endl;
+        }
+
         return nmatches;
     }
 

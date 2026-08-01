@@ -38,6 +38,7 @@
 #include<dirent.h>
 
 #include<opencv2/core/core.hpp>
+#include<opencv2/imgproc.hpp>
 
 #include<System.h>
 
@@ -166,10 +167,73 @@ int main(int argc, char **argv)
             if(bLogFrames)
                 cout << "FRAME ni=" << ni << " ts_ns=" << llround(tframe*1e9) << endl;
 
+            // Diagnostic (ORBSLAM_DIAG_SHARPNESS=1): per-frame blur/noise signature,
+            // measured on the raw captured image before any ORB-SLAM3 rectification/
+            // processing. Placed here rather than in core because the correct exposure
+            // phase (vExposurePhaseCam[seq][ni]) is already a plain local value at this
+            // exact point -- no ts-join needed, unlike core-side diagnostics where the
+            // phase tag isn't set on the Frame until after construction. Low mean
+            // intensity + high Laplacian variance = noise-dominated (short/dark
+            // exposure); normal mean + low Laplacian variance = blur-dominated
+            // (long/bright exposure) -- the two exposure extremes degrade images in
+            // different ways, not just "less usable signal" in both cases the same way.
+            static const bool bDiagSharpness = (getenv("ORBSLAM_DIAG_SHARPNESS") != nullptr);
+            if(bDiagSharpness)
+            {
+                cv::Mat grayL, grayR, lapL, lapR;
+                if(imLeft.channels()==1) grayL = imLeft;
+                else cv::cvtColor(imLeft, grayL, cv::COLOR_BGR2GRAY);
+                if(imRight.channels()==1) grayR = imRight;
+                else cv::cvtColor(imRight, grayR, cv::COLOR_BGR2GRAY);
+
+                cv::Laplacian(grayL, lapL, CV_64F);
+                cv::Laplacian(grayR, lapR, CV_64F);
+                cv::Scalar meanL, stdL, meanR, stdR, meanIntensityL;
+                cv::meanStdDev(lapL, meanL, stdL);
+                cv::meanStdDev(lapR, meanR, stdR);
+                cv::meanStdDev(grayL, meanIntensityL, cv::Scalar());
+
+                cout << "SHARPNESS ni=" << ni << " phase=" << vExposurePhaseCam[seq][ni]
+                     << " lapVarLeft=" << (stdL[0]*stdL[0])
+                     << " lapVarRight=" << (stdR[0]*stdR[0])
+                     << " meanIntensityLeft=" << meanIntensityL[0]
+                     << " ts_ns=" << llround(tframe*1e9) << endl;
+            }
+
+            // Experiment (ORBSLAM_SAT_GATE=1, ORBSLAM_SAT_MAX_FRAC=<float, default 0.30>):
+            // skip using a frame for tracking entirely when more than this fraction of
+            // its pixels are saturated (>=250/255). Quick test of whether severely
+            // blown-out frames (e.g. the July 18 tunnel-exit transient, where bright-
+            // phase frames reach up to 86% saturated and mid-phase up to 27%, confirmed
+            // via direct measurement) are actively hurting more than the partial
+            // information in them helps, vs. the confidence gate in ComputeStereoMatches
+            // already filtering out the worst individual keypoint matches. Distinct from
+            // the earlier, reverted "drop a whole exposure phase" idea: this is a
+            // dynamic, per-frame, content-based skip -- an otherwise-fine dark or mid
+            // frame is never skipped, only a frame that happens to be this washed out.
+            static const bool bSatGateEnabled = (getenv("ORBSLAM_SAT_GATE") != nullptr);
+            static const float fSatMaxFrac = getenv("ORBSLAM_SAT_MAX_FRAC") ?
+                (float)atof(getenv("ORBSLAM_SAT_MAX_FRAC")) : 0.30f;
+            static const bool bDiagSat = (getenv("ORBSLAM_DIAG_SAT") != nullptr);
+            bool bSkipFrame = false;
+            if(bSatGateEnabled || bDiagSat)
+            {
+                cv::Mat grayL;
+                if(imLeft.channels()==1) grayL = imLeft;
+                else cv::cvtColor(imLeft, grayL, cv::COLOR_BGR2GRAY);
+                const float satFrac = (float)cv::countNonZero(grayL >= 250) / (grayL.rows*grayL.cols);
+                bSkipFrame = bSatGateEnabled && satFrac > fSatMaxFrac;
+                if(bDiagSat)
+                    cout << "SAT_CHECK ni=" << ni << " phase=" << vExposurePhaseCam[seq][ni]
+                         << " satFrac=" << satFrac << " skipped=" << (bSkipFrame ? 1 : 0)
+                         << " ts_ns=" << llround(tframe*1e9) << endl;
+            }
+
             std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
 
             // Pass the images to the SLAM system
-            SLAM.TrackStereo(imLeft,imRight,tframe, vector<ORB_SLAM3::IMU::Point>(), vstrImageLeft[seq][ni], vExposurePhaseCam[seq][ni]);
+            if(!bSkipFrame)
+                SLAM.TrackStereo(imLeft,imRight,tframe, vector<ORB_SLAM3::IMU::Point>(), vstrImageLeft[seq][ni], vExposurePhaseCam[seq][ni]);
 
             // Diagnostic frame export (ORBSLAM_DUMP_FRAMES_DIR=<dir>): saves the same
             // tracked-keypoints-overlaid image the Pangolin viewer shows, one PNG per
